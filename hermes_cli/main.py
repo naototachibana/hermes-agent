@@ -1743,6 +1743,9 @@ def cmd_chat(args):
 
     _resolve_chat_session_args(args, use_tui)
 
+    # Own the resolved CLI workspace; child gateway/cron launchers cannot inherit this policy.
+    os.environ["_HERMES_LOCAL_CLI_PID"] = str(os.getpid())
+
     _warn_retired_xai_models()
 
     # First-run guard: the free-tier bootstrap runs first (synchronously here; it is the only thing

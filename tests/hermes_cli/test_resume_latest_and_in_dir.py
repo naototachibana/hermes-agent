@@ -278,3 +278,83 @@ def test_in_dir_leaves_unset_terminal_cwd_unset(main_mod, monkeypatch, tmp_path)
     main_mod._apply_in_dir(_args(in_dir=str(target)))
 
     assert "TERMINAL_CWD" not in os.environ
+
+
+@pytest.mark.parametrize("launch_name,in_name", [
+    ("workspace", None), ("configured", None), ("configured", "workspace"),
+])
+def test_local_cli_cwd_survives_terminal_and_dotenv_bridges(
+    tmp_path, monkeypatch, main_mod, launched, launch_name, in_name,
+):
+    """The launch resolver, both config bridges and project loader agree on cwd."""
+    import os
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from agent.runtime_cwd import resolve_context_cwd
+    from agent.prompt_builder import build_context_files_prompt
+    from tools import terminal_tool
+
+    for name in ("workspace", "configured"):
+        project = tmp_path / name
+        project.mkdir()
+        (project / "AGENTS.md").write_text(f"Project identity: {name}\n")
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"terminal:\n  backend: local\n  cwd: {tmp_path / 'configured'}\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("TERMINAL_CWD", "_HERMES_GATEWAY", "HERMES_CRON_SESSION", "_HERMES_LOCAL_CLI_PID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path / launch_name)
+    expected = tmp_path / (in_name or launch_name)
+    with pytest.raises(SystemExit) as exc:
+        main_mod.cmd_chat(_args(in_dir=str(expected) if in_name else None))
+    assert exc.value.code == 0
+
+    from cli import load_cli_config
+    load_cli_config()
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    assert terminal_tool._get_env_config()["cwd"] == str(expected)
+    load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+    assert os.environ["TERMINAL_CWD"] == str(expected)
+    assert resolve_context_cwd() == expected
+    prompt = build_context_files_prompt(cwd=str(resolve_context_cwd()), skip_soul=True)
+    assert f"Project identity: {expected.name}" in prompt
+    other = "configured" if expected.name == "workspace" else "workspace"
+    assert f"Project identity: {other}" not in prompt
+
+
+@pytest.mark.parametrize("surface", [
+    "gateway", "cron", "ssh", "docker", "child", "non_cli", "env_target", "explicit_config",
+])
+def test_cli_origin_does_not_override_other_terminal_surfaces(tmp_path, monkeypatch, surface):
+    import os
+    from gateway.session_context import _VAR_MAP
+    from hermes_cli.config import apply_terminal_config_to_env
+
+    launch, configured = tmp_path / "launch", tmp_path / "configured"
+    launch.mkdir()
+    configured.mkdir()
+    monkeypatch.chdir(launch)
+    backend = surface if surface in ("ssh", "docker") else "local"
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(f"terminal:\n  backend: {backend}\n  cwd: {configured}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(launch))
+    monkeypatch.setenv("_HERMES_LOCAL_CLI_PID", str(os.getpid()))
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    if surface == "gateway":
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    elif surface == "child":
+        monkeypatch.setenv("_HERMES_LOCAL_CLI_PID", str(os.getpid() + 1))
+    elif surface == "non_cli":
+        monkeypatch.delenv("_HERMES_LOCAL_CLI_PID")
+    env = dict(os.environ) if surface == "env_target" else None
+    config = {"terminal": {"backend": backend, "cwd": str(configured)}} if surface == "explicit_config" else None
+    token = _VAR_MAP["HERMES_CRON_SESSION"].set("1" if surface == "cron" else "")
+    try:
+        result = apply_terminal_config_to_env(env=env, config=config, override=True)
+        assert result["TERMINAL_CWD"] == str(configured)
+    finally:
+        _VAR_MAP["HERMES_CRON_SESSION"].reset(token)

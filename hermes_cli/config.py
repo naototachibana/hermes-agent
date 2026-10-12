@@ -2185,6 +2185,18 @@ def apply_terminal_config_to_env(
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
             continue
+        if (
+            cfg_key == "cwd" and terminal_backend == "local"
+            and env is None and config is None
+            and target.get("_HERMES_LOCAL_CLI_PID") == str(os.getpid())
+            and target.get("_HERMES_GATEWAY") != "1"
+        ):
+            from gateway.session_context import get_session_env
+
+            if get_session_env("HERMES_CRON_SESSION") != "1":
+                # Preserve launch/--in/restore cwd after dotenv reload or terminal initialization.
+                target[env_var] = os.getcwd()
+                continue
         value = terminal_cfg[cfg_key]
         if not _terminal_config_value_is_bridgeable(cfg_key, value):
             continue
