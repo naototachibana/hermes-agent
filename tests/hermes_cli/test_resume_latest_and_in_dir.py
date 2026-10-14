@@ -358,3 +358,59 @@ def test_cli_origin_does_not_override_other_terminal_surfaces(tmp_path, monkeypa
         assert result["TERMINAL_CWD"] == str(configured)
     finally:
         _VAR_MAP["HERMES_CRON_SESSION"].reset(token)
+
+
+def test_worktree_selection_survives_config_and_dotenv_reload(tmp_path, monkeypatch, main_mod, launched):
+    import atexit
+    import os
+    import subprocess
+    from pathlib import Path
+    import cli
+    import model_tools
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from agent.runtime_cwd import resolve_agent_cwd
+    from tools import terminal_tool
+
+    repo, configured, home = tmp_path / "repo", tmp_path / "configured", tmp_path / "profile"
+    for directory in (repo, configured, home):
+        directory.mkdir()
+    (repo / "AGENTS.md").write_text("Isolated workspace instructions\n")
+    for command in (
+        ["git", "init"], ["git", "add", "AGENTS.md"],
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture"],
+    ):
+        subprocess.run(command, cwd=repo, check=True, capture_output=True, timeout=10)
+    (home / "config.yaml").write_text(
+        f"terminal:\n  backend: local\n  cwd: {configured}\nworktree_sync: false\n"
+    )
+    (home / ".env").write_text("WORKSPACE_RELOAD_PROBE=loaded\n")
+    monkeypatch.setenv("WORKSPACE_RELOAD_PROBE", "before")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("TERMINAL_CWD", "_HERMES_GATEWAY", "HERMES_CRON_SESSION", "_HERMES_LOCAL_CLI_PID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(cli, "_active_worktree", None)
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr(cli, "_prune_stale_worktrees", lambda *args: None)
+    monkeypatch.setattr(cli, "_maintain_pack_health", lambda *args: None)
+    with pytest.raises(SystemExit):
+        main_mod.cmd_chat(_args(worktree=True))
+    monkeypatch.setattr(cli, "CLI_CONFIG", cli.load_cli_config())
+    join = cli._start_worktree_setup(False, False, True, False)
+    assert join is not None
+    info = join()
+    assert info is not None
+    try:
+        expected = Path(info["path"])
+        assert expected != repo and expected.is_dir()
+        assert Path.cwd() == repo
+        assert os.environ["TERMINAL_CWD"] == str(expected)
+        load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+        assert os.environ["WORKSPACE_RELOAD_PROBE"] == "loaded"
+        cli.load_cli_config()
+        monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+        assert terminal_tool._get_env_config()["cwd"] == str(expected)
+        assert resolve_agent_cwd() == expected
+    finally:
+        atexit.unregister(cli._cleanup_worktree)
+        cli._cleanup_worktree(info)

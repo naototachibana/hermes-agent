@@ -909,6 +909,7 @@ from hermes_cli.main_tui_launch import (
     _resolve_use_tui,
     _sync_bundled_skills_quietly,
 )
+from hermes_cli.main_workspace import _resolve_chat_session_args
 
 
 def _is_termux_startup_environment(env: dict[str, str] | None = None) -> bool:
@@ -1528,55 +1529,6 @@ def _import_foreign_resume(args) -> None:
     args.resume = _imported_id
 
 
-def _resolve_chat_session_args(args, use_tui: bool) -> None:
-    """Normalize --in / --resume / --continue on ``args`` before agent init.
-
-    Order matters: ``--in DIR`` chdirs first so workspace-scoped "latest"/-c
-    lookups key off DIR (and pins the session there, skipping cwd restore);
-    then ``--resume latest`` → MRU id, ``--continue`` → ``--resume``,
-    ``--resume @claude/@codex`` → imported session id, title → id; finally
-    cd back into a resumed session's recorded cwd (best-effort, opt-out via
-    --no-restore-cwd, skipped under --worktree).
-    """
-    _apply_in_dir(args)
-
-    # --resume latest: same resolution as bare `-c`. The keyword wins over a
-    # session literally titled "latest" (still reachable by ID or `-c latest`).
-    _resume_raw = getattr(args, "resume", None)
-    if isinstance(_resume_raw, str) and _resume_raw.strip().lower() == "latest":
-        _last_id = _latest_session_id(use_tui)
-        if _last_id:
-            args.resume = _last_id
-        else:
-            kind = "TUI" if use_tui else "CLI"
-            print(f"No previous {kind} session found to resume.")
-            print("Use 'hermes sessions list' to see available sessions.")
-            sys.exit(1)
-
-    _resolve_continue_arg(args, use_tui=use_tui)
-
-    _import_foreign_resume(args)
-
-    resume_val = getattr(args, "resume", None)
-    if resume_val:
-        # On miss keep the original so _init_agent reports "Session not found" with it.
-        args.resume = _resolve_session_by_name_or_id(resume_val) or resume_val
-
-    # cd back into a resumed session's recorded cwd (opt out: --no-restore-cwd;
-    # --worktree owns its own dir). A missing dir warns and stays put.
-    if (
-        getattr(args, "resume", None)
-        and not getattr(args, "no_restore_cwd", False)
-        and not getattr(args, "worktree", False)
-    ):
-        with _session_db() as db:  # never let cwd-restore break a resume
-            _saved_cwd = ((db.get_session(args.resume) or {}).get("cwd") or "").strip()
-            if _saved_cwd and not os.path.isdir(_saved_cwd):
-                print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
-            elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
-                os.chdir(_saved_cwd)
-                print(f"↪ restored workspace dir: {_saved_cwd}")
-
 
 def _warn_retired_xai_models() -> None:
     """One-shot xAI retirement warning on stderr; non-blocking, never fails startup."""
@@ -1737,8 +1689,6 @@ def cmd_chat(args):
 
     _resolve_chat_session_args(args, use_tui)
 
-    # Own the resolved CLI workspace; child gateway/cron launchers cannot inherit this policy.
-    os.environ["_HERMES_LOCAL_CLI_PID"] = str(os.getpid())
 
     _warn_retired_xai_models()
 
